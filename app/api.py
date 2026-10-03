@@ -19,13 +19,16 @@ from .errors import (
     UnknownTaskDependency,
     WorkflowNotFound,
 )
-from .models import RunInfo, RunStatus, TaskStatus, WorkflowSpec
+from .models import RunInfo, RunStatus, WorkflowSpec
 from .store import Store
 
 _STATUS_CODES = {
     "workflow_not_found": 404,
     "run_not_found": 404,
     "invalid_state_transition": 409,
+    "task_already_succeeded": 409,
+    "task_currently_running": 409,
+    "task_blocked_by_upstream": 409,
     "cyclic_dependency": 422,
     "unknown_task_dependency": 422,
     "duplicate_task_name": 422,
@@ -76,9 +79,22 @@ class CreateRunResponse(BaseModel):
     created: bool
 
 
-def create_app(db_path: str = "orchestrator.db", max_concurrent_tasks: int = 4) -> FastAPI:
+def create_app(
+    db_path: str = "orchestrator.db",
+    max_concurrent_tasks: int = 4,
+    *,
+    executor_id: str | None = None,
+    lease_seconds: float = 30.0,
+    heartbeat_interval: float = 5.0,
+) -> FastAPI:
     store = Store(db_path)
-    orchestrator = Orchestrator(store, max_concurrent_tasks=max_concurrent_tasks)
+    orchestrator = Orchestrator(
+        store,
+        max_concurrent_tasks=max_concurrent_tasks,
+        executor_id=executor_id,
+        lease_seconds=lease_seconds,
+        heartbeat_interval=heartbeat_interval,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -129,20 +145,28 @@ def create_app(db_path: str = "orchestrator.db", max_concurrent_tasks: int = 4) 
 
     @app.post("/runs/{run_id}/tasks/{task_name}/rerun")
     async def rerun_task(run_id: str, task_name: str) -> RunInfo:
-        """手动重跑一个 FAILED 的任务。
+        """手动重跑一个 FAILED 的任务，被阻塞的下游会自动解除阻塞继续跑。
 
-        只允许 FAILED -> PENDING；对 SUCCEEDED/RUNNING 等状态重跑会被 CAS
-        拒绝，返回 409 及可区分的原因（invalid_state_transition）。
+        只允许 FAILED -> PENDING。对其他状态的非法操作返回 409 及可区分的
+        reason：已成功（task_already_succeeded）、正在执行
+        （task_currently_running）、被上游失败阻塞（task_blocked_by_upstream）。
         """
         info = store.get_run(run_id)
         if info is None:
             raise RunNotFound(f"run {run_id} not found")
-        store.transition_task(
-            run_id, task_name, TaskStatus.PENDING,
-            allowed_from=(TaskStatus.FAILED,), error=None,
-        )
+        store.requeue_failed_task(run_id, task_name)
         if info.status in (RunStatus.FAILED, RunStatus.SUCCEEDED):
             await orchestrator.start_run(run_id)
         return store.get_run(run_id)
+
+    @app.get("/executors")
+    async def list_executors() -> dict:
+        """列出上报过心跳的执行者及其最近心跳时间（多实例可观测性）。"""
+        return {
+            "self": orchestrator.executor_id,
+            "lease_seconds": orchestrator.lease_seconds,
+            "heartbeat_interval": orchestrator.heartbeat_interval,
+            "executors": store.list_executors(),
+        }
 
     return app

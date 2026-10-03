@@ -15,6 +15,8 @@ BUSINESS_AREAS = {
     "TestRetryAndFailure": "重试与失败处理",
     "TestRecoveryAfterRestart": "服务重启后的续跑恢复",
     "TestConcurrencyAndIdempotency": "并发控制与幂等",
+    "TestMultiExecutorSafety": "多执行者安全与失联接管",
+    "TestFailureBlastRadius": "失败影响面标记与恢复续跑",
 }
 
 

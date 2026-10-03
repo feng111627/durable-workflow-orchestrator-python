@@ -11,6 +11,9 @@ register_builtins()
 app = create_app(
     db_path=os.environ.get("ORCH_DB_PATH", "orchestrator.db"),
     max_concurrent_tasks=int(os.environ.get("ORCH_MAX_CONCURRENT_TASKS", "4")),
+    executor_id=os.environ.get("ORCH_EXECUTOR_ID") or None,
+    lease_seconds=float(os.environ.get("ORCH_LEASE_SECONDS", "30")),
+    heartbeat_interval=float(os.environ.get("ORCH_HEARTBEAT_INTERVAL", "5")),
 )
 
 if __name__ == "__main__":

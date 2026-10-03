@@ -112,7 +112,8 @@ class TestRetryAndFailure:
         assert info.status == RunStatus.FAILED
         assert ran == []  # 下游任务不被执行
         by_name = {t.task_name: t for t in info.tasks}
-        assert by_name["down"].status == TaskStatus.PENDING
+        # 下游被明确标记为“因上游失败被阻塞”，而不是混在普通 PENDING 里
+        assert by_name["down"].status == TaskStatus.BLOCKED
 
     def test_rerun_failed_task_via_api(self, db_path):
         attempts = {"n": 0}
@@ -155,6 +156,7 @@ class TestRetryAndFailure:
             resp = client.post(f"/runs/{run_id}/tasks/t/rerun")
             assert resp.status_code == 409
             body = resp.json()
-            assert body["reason"] == "invalid_state_transition"
+            # 可区分的原因：不是笼统的非法迁移，而是明确“已成功”
+            assert body["reason"] == "task_already_succeeded"
             assert body["current"] == "SUCCEEDED"
             assert body["target"] == "PENDING"

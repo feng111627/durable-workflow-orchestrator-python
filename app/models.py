@@ -19,6 +19,8 @@ class TaskStatus(str, enum.Enum):
     RUNNING = "RUNNING"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
+    # 因上游（直接或间接）失败而被阻塞，等待上游恢复后可继续
+    BLOCKED = "BLOCKED"
 
 
 class TaskSpec(BaseModel):
@@ -45,6 +47,8 @@ class TaskRunInfo(BaseModel):
     attempts: int = 0
     error: str | None = None
     result: Any = None
+    # 当前持有该任务租约的执行者 id（无人持有时为 None）
+    owner: str | None = None
 
 
 class RunInfo(BaseModel):

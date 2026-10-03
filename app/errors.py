@@ -40,6 +40,24 @@ class InvalidStateTransition(OrchestratorError):
         self.target = target
 
 
+class TaskAlreadySucceeded(InvalidStateTransition):
+    """对已成功任务执行了非法操作（如重跑）。"""
+
+    reason = "task_already_succeeded"
+
+
+class TaskCurrentlyRunning(InvalidStateTransition):
+    """任务正在被执行者处理中，操作被拒绝。"""
+
+    reason = "task_currently_running"
+
+
+class TaskBlockedByUpstream(InvalidStateTransition):
+    """任务因上游失败被阻塞，需先恢复失败的上游任务。"""
+
+    reason = "task_blocked_by_upstream"
+
+
 class RetryableTaskError(Exception):
     """任务执行时可重试的失败。"""
 

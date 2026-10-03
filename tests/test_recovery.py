@@ -36,7 +36,8 @@ class TestRecoveryAfterRestart:
         async def first_boot():
             store = Store(db_path)
             store.save_workflow(spec)
-            orch = Orchestrator(store)
+            # 短租约：模拟宕机后能让下一次启动快速判定失联并接管
+            orch = Orchestrator(store, lease_seconds=0.3, heartbeat_interval=0.1)
             run_id, _ = store.create_run_idempotent("w", "k")
             await orch.start_run(run_id)
             # 等 a 完成、b 进入 RUNNING（被 gate 卡住）
@@ -58,10 +59,10 @@ class TestRecoveryAfterRestart:
 
         async def second_boot():
             store = Store(db_path)  # 同一个数据库文件 = 重启后状态还在
-            orch = Orchestrator(store)
+            orch = Orchestrator(store, lease_seconds=0.3, heartbeat_interval=0.1)
             recovered = await orch.recover_unfinished()
             assert recovered == [run_id]
-            # 中断时 RUNNING 的 b 被重置为 PENDING，没有丢失
+            # 已成功的不重跑；中断时 RUNNING 的 b 在租约过期后被接管重跑
             info = store.get_run(run_id)
             by_name = {t.task_name: t for t in info.tasks}
             assert by_name["a"].status == TaskStatus.SUCCEEDED
