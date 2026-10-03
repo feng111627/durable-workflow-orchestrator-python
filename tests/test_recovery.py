@@ -114,3 +114,87 @@ class TestRecoveryAfterRestart:
 
         assert asyncio.run(reboot()) == []  # 已完成运行不会被恢复
         assert calls["n"] == 1  # 也不会被重跑
+
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+
+class _Clock:
+    def __init__(self):
+        self.now = datetime(2026, 10, 3, tzinfo=timezone.utc)
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += timedelta(seconds=seconds)
+
+
+class TestRecoveryDistinguishesAliveFromDead:
+    def test_restart_keeps_alive_executor_tasks_and_requeues_stale(self, db_path):
+        """重启/新实例启动恢复时：活执行者仍在处理的任务保持 RUNNING 原样；
+        只有确实失联（心跳超时）的任务才被接管重排队；已成功的永不重跑。"""
+        clock = _Clock()
+        done_calls = {"n": 0}
+
+        def done_work(params):
+            done_calls["n"] += 1
+            return "DONE"
+
+        handlers.register("alive_action", lambda p: None)
+        handlers.register("stale_action", lambda p: None)
+        handlers.register("done_action", done_work)
+
+        spec = WorkflowSpec(
+            name="w",
+            tasks=[
+                TaskSpec(name="done", action="done_action"),
+                TaskSpec(name="alive", action="alive_action"),
+                TaskSpec(name="stale", action="stale_action"),
+            ],
+        )
+
+        async def scenario():
+            store = Store(db_path, clock=clock)
+            store.save_workflow(spec)
+            run_id, _ = store.create_run_idempotent("w", "k")
+            # 直接落盘构造三类任务：已完成 / A 正在跑且心跳新鲜 / A 正在跑但失联
+            e_done = store.claim_task(
+                run_id, "done", "A", heartbeat_timeout_seconds=30
+            )
+            store.complete_task(
+                run_id, "done", "A", e_done, TaskStatus.SUCCEEDED, result="DONE"
+            )
+            e_alive = store.claim_task(
+                run_id, "alive", "A", heartbeat_timeout_seconds=30
+            )
+            e_stale = store.claim_task(
+                run_id, "stale", "A", heartbeat_timeout_seconds=30
+            )
+            # 时间推进超过阈值：alive 仍上报心跳（活），stale 再无心跳（崩）
+            clock.advance(45)
+            assert store.heartbeat_task(run_id, "alive", "A", e_alive) is True
+
+            # 恢复第一阶段（确定性）：只重排队失联任务。
+            # 活执行者任务不动、已成功任务不碰；不启动调度循环，避免刚重排队
+            # 的 stale 立刻被本实例认领执行（接管后的实际执行由
+            # test_engine_takeover / test_multi_process 覆盖）。
+            requeued = store.requeue_stale_tasks(heartbeat_timeout_seconds=30)
+            assert sorted(t for _, t in requeued) == ["stale"]
+            by_name = {t.task_name: t for t in store.get_run(run_id).tasks}
+            # 活执行者的任务保持 RUNNING、仍归 A、纪元不变
+            assert by_name["alive"].status == TaskStatus.RUNNING
+            assert by_name["alive"].executor_id == "A"
+            assert by_name["alive"].claim_epoch == e_alive
+            # 失联任务被重排队，历史尝试次数保留
+            assert by_name["stale"].status == TaskStatus.PENDING
+            assert by_name["stale"].attempts == 1
+            # 已成功任务纹丝不动
+            assert by_name["done"].status == TaskStatus.SUCCEEDED
+            assert by_name["done"].result == "DONE"
+            store.close()
+            return run_id
+
+        asyncio.run(scenario())
+        # 整个恢复过程没有执行任何任务处理器（纯恢复判定），已成功任务更不会重跑
+        assert done_calls["n"] == 0

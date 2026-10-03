@@ -19,13 +19,14 @@ from .errors import (
     UnknownTaskDependency,
     WorkflowNotFound,
 )
-from .models import RunInfo, RunStatus, TaskStatus, WorkflowSpec
+from .models import RunInfo, WorkflowSpec
 from .store import Store
 
 _STATUS_CODES = {
     "workflow_not_found": 404,
     "run_not_found": 404,
     "invalid_state_transition": 409,
+    "stale_executor_write": 409,
     "cyclic_dependency": 422,
     "unknown_task_dependency": 422,
     "duplicate_task_name": 422,
@@ -76,13 +77,30 @@ class CreateRunResponse(BaseModel):
     created: bool
 
 
-def create_app(db_path: str = "orchestrator.db", max_concurrent_tasks: int = 4) -> FastAPI:
+def create_app(
+    db_path: str = "orchestrator.db",
+    max_concurrent_tasks: int = 4,
+    *,
+    heartbeat_interval_seconds: float = 1.0,
+    heartbeat_timeout_seconds: float = 30.0,
+    maintenance_interval_seconds: float = 1.0,
+    executor_id: str | None = None,
+) -> FastAPI:
     store = Store(db_path)
-    orchestrator = Orchestrator(store, max_concurrent_tasks=max_concurrent_tasks)
+    orchestrator = Orchestrator(
+        store,
+        max_concurrent_tasks=max_concurrent_tasks,
+        executor_id=executor_id,
+        heartbeat_interval_seconds=heartbeat_interval_seconds,
+        heartbeat_timeout_seconds=heartbeat_timeout_seconds,
+        maintenance_interval_seconds=maintenance_interval_seconds,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # 服务重启后恢复未完成的运行：已成功的任务不重跑，RUNNING 的重排队
+        # 启动执行者：登记心跳；只接管“确实失联”的任务（心跳超时的 RUNNING），
+        # 仍被其他活着的实例持有的任务保持原样，已成功的任务任何情况下不重跑
+        await orchestrator.start()
         recovered = await orchestrator.recover_unfinished()
         if recovered:
             app.state.recovered_runs = recovered
@@ -100,6 +118,10 @@ def create_app(db_path: str = "orchestrator.db", max_concurrent_tasks: int = 4) 
         if isinstance(exc, InvalidStateTransition):
             body["current"] = exc.current
             body["target"] = exc.target
+            # 细粒度可区分原因码：task_already_succeeded / task_running /
+            # task_blocked / task_pending / task_missing / task_not_runnable
+            if exc.code is not None:
+                body["code"] = exc.code
         return JSONResponse(
             status_code=_STATUS_CODES.get(exc.reason, 500), content=body
         )
@@ -129,20 +151,15 @@ def create_app(db_path: str = "orchestrator.db", max_concurrent_tasks: int = 4) 
 
     @app.post("/runs/{run_id}/tasks/{task_name}/rerun")
     async def rerun_task(run_id: str, task_name: str) -> RunInfo:
-        """手动重跑一个 FAILED 的任务。
+        """手动重跑一个 FAILED 的任务并自动恢复其失败影响面。
 
-        只允许 FAILED -> PENDING；对 SUCCEEDED/RUNNING 等状态重跑会被 CAS
-        拒绝，返回 409 及可区分的原因（invalid_state_transition）。
+        只允许 FAILED -> PENDING；对 SUCCEEDED/RUNNING/BLOCKED/PENDING 等状态
+        重跑会被拒绝，返回 409，并在 reason=invalid_state_transition 之下
+        额外携带可区分的 code（task_already_succeeded/task_running/
+        task_blocked/task_pending）。原先被该失败挡住的 BLOCKED 下游会在依赖
+        重新满足后自动解阻并继续跑完，无需重新提交工作流。
         """
-        info = store.get_run(run_id)
-        if info is None:
-            raise RunNotFound(f"run {run_id} not found")
-        store.transition_task(
-            run_id, task_name, TaskStatus.PENDING,
-            allowed_from=(TaskStatus.FAILED,), error=None,
-        )
-        if info.status in (RunStatus.FAILED, RunStatus.SUCCEEDED):
-            await orchestrator.start_run(run_id)
-        return store.get_run(run_id)
+        info = await orchestrator.rerun_task(run_id, task_name)
+        return info
 
     return app

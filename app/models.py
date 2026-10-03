@@ -19,6 +19,8 @@ class TaskStatus(str, enum.Enum):
     RUNNING = "RUNNING"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
+    # 因（直接或间接）上游任务失败而被阻塞，区别于普通的 PENDING 等待
+    BLOCKED = "BLOCKED"
 
 
 class TaskSpec(BaseModel):
@@ -45,6 +47,11 @@ class TaskRunInfo(BaseModel):
     attempts: int = 0
     error: str | None = None
     result: Any = None
+    # 当前认领该任务的执行者 ID（未被认领时为 None）
+    executor_id: str | None = None
+    # 认领纪元（fencing token）：每次被（重新）认领单调递增，
+    # 旧执行者的迟到写回会因 epoch 不匹配被忽略
+    claim_epoch: int = 0
 
 
 class RunInfo(BaseModel):

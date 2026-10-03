@@ -112,7 +112,8 @@ class TestRetryAndFailure:
         assert info.status == RunStatus.FAILED
         assert ran == []  # 下游任务不被执行
         by_name = {t.task_name: t for t in info.tasks}
-        assert by_name["down"].status == TaskStatus.PENDING
+        # 下游被明确标记为“因上游失败阻塞”，与普通 PENDING 等待区分
+        assert by_name["down"].status == TaskStatus.BLOCKED
 
     def test_rerun_failed_task_via_api(self, db_path):
         attempts = {"n": 0}
