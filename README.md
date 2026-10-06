@@ -61,7 +61,8 @@ curl localhost:8000/executors
 
 ## 失败影响面与恢复续跑
 
-- 某个任务彻底失败（FAILED）后，它的**直接和间接下游**中尚未开始的任务会被级联标记为 `BLOCKED`（`error` 字段注明被哪个上游阻塞），不会混在普通的 PENDING 等待里；整个运行标记 FAILED。与失败任务无关的分支不受影响，照常执行。
+- 某个任务彻底失败（FAILED）后，它的**直接和间接下游**中尚未开始的任务会被级联标记为 `BLOCKED`（`error` 字段注明被哪个上游阻塞），不会混在普通的 PENDING 等待里；整个运行最终标记 FAILED。
+- **失败只影响它自己的下游**：与失败任务没有依赖关系的分支不受影响——正在执行的任务继续跑完，尚未开始的照常调度执行。运行只有在再没有任何任务推进时（没有在执行的任务、没有可开始的任务）才判定终态，因此不会出现"运行已判失败，却还有任务永远卡在 RUNNING/PENDING 没人管"的状态；终态下每个任务只会是 SUCCEEDED / FAILED / BLOCKED 之一。
 - 通过 rerun 接口把 FAILED 任务重新排队（`FAILED -> PENDING`）后，所有不再有失败祖先的 `BLOCKED` 任务会**自动解除阻塞**回到 PENDING，顺着依赖继续跑完，不需要重新提交整个工作流；菱形依赖下，只有当全部失败的上游都恢复后下游才解除阻塞。
 - 对任务的非法操作返回 409 及**可区分**的 `reason`，便于调用方分别处理：
   - `task_already_succeeded`：任务已成功，任何情况下都不会再跑；
@@ -110,6 +111,32 @@ uv run pytest tests/ -v
 - **并发控制与幂等**（5 例）：并发上限遵守且排队任务不丢弃、重复调度不重复执行、并发认领 CAS 拒绝、非法状态迁移拒绝、并发下幂等创建唯一。
 - **多执行者安全与失联接管**（6 例）：存活执行者的任务不可被抢、租约过期接管且 attempts 连续计数、**8 线程真实并发认领恰有一个成功**、失联执行者迟到写回被忽略（双执行者引擎级场景）、存储层栅栏拒绝、心跳阻止存活同伴被接管。
 - **失败影响面标记与恢复续跑**（5 例）：直接+间接下游级联 BLOCKED 且无关分支不受影响、上游恢复后下游自动续跑（不重提交流程）、菱形依赖全部上游恢复才解除阻塞、对 BLOCKED/RUNNING 任务的非法操作返回可区分 reason。
+- **失败隔离：无关分支不受失败牵连**（1 例）：真实并发下让会失败的任务与跑得久的无关任务同时进行，失败发生后无关任务仍在正常执行、放行后正常跑完，运行最终 FAILED，终态下没有任何任务卡在 RUNNING/PENDING；场景连跑多轮验证稳定。
+
+### 本地手动验证失败隔离
+
+```bash
+# 启动服务（按“快速开始”），然后定义一个两条互不相干分支的工作流：
+# bad 立即失败，slow 睡 30 秒
+curl -X POST localhost:8000/workflows -H 'content-type: application/json' -d '{
+  "name": "iso",
+  "tasks": [
+    {"name": "bad",        "action": "fail"},
+    {"name": "bad_child",  "action": "echo", "depends_on": ["bad"]},
+    {"name": "slow",       "action": "sleep", "params": {"seconds": 30}},
+    {"name": "slow_child", "action": "echo", "depends_on": ["slow"]}
+  ]
+}'
+curl -X POST localhost:8000/workflows/iso/runs -H 'content-type: application/json' -d '{"idempotency_key":"r1"}'
+
+# 失败发生后的 30 秒内查询：bad=FAILED、bad_child=BLOCKED，
+# 而无关分支的 slow 仍在 RUNNING（运行此时还是 RUNNING，不会提前判失败）
+curl localhost:8000/runs/<run_id>
+
+# 30 秒后再查询：slow 与 slow_child 均 SUCCEEDED，运行 FAILED，
+# 没有任何任务卡在 RUNNING/PENDING
+curl localhost:8000/runs/<run_id>
+```
 
 ### 本地手动验证多实例行为
 

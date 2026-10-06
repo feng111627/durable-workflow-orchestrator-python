@@ -17,6 +17,7 @@ BUSINESS_AREAS = {
     "TestConcurrencyAndIdempotency": "并发控制与幂等",
     "TestMultiExecutorSafety": "多执行者安全与失联接管",
     "TestFailureBlastRadius": "失败影响面标记与恢复续跑",
+    "TestFailureIsolation": "失败隔离：无关分支不受失败牵连",
 }
 
 

@@ -3,6 +3,11 @@
 多执行者安全：每个 Orchestrator 实例是一个执行者（executor），通过租约
 认领任务、定期心跳续期；只有租约过期（执行者失联）的任务才会被其他
 执行者接管；失联执行者的迟到写回因栅栏令牌不匹配而被忽略。
+
+失败隔离：任务彻底失败只影响它自己的下游（级联标记 BLOCKED）；与失败
+无关的分支照常调度、照常跑完。只有当运行里再没有任何任务在推进时
+（无本地执行任务、无任何 RUNNING 任务、无可调度的 PENDING 任务），
+运行才被判定终态，不会出现"运行已判失败却还有任务永远卡在执行中"。
 """
 from __future__ import annotations
 
@@ -162,13 +167,13 @@ class Orchestrator:
             while True:
                 info = self.store.get_run(run_id)
                 by_name = {t.task_name: t for t in info.tasks}
-                if any(t.status == TaskStatus.FAILED for t in info.tasks):
-                    self.store.set_run_status(run_id, RunStatus.FAILED)
-                    break
                 if all(t.status == TaskStatus.SUCCEEDED for t in info.tasks):
                     self.store.set_run_status(run_id, RunStatus.SUCCEEDED)
                     break
-                # 找出可以开始的任务：PENDING 且所有依赖都已 SUCCEEDED
+                # 找出可以开始的任务：PENDING 且所有依赖都已 SUCCEEDED。
+                # 失败只影响它自己的下游：失败任务的下游已被级联标记为
+                # BLOCKED（不再是 PENDING），与失败无关的分支照常调度、
+                # 照常跑完，不被牵连。
                 for t in info.tasks:
                     if t.status != TaskStatus.PENDING:
                         continue
@@ -180,7 +185,10 @@ class Orchestrator:
                         )
                 any_running = any(t.status == TaskStatus.RUNNING for t in info.tasks)
                 if not executing and not any_running:
-                    # 没有可推进的任务也未达终态：剩余任务因依赖失败被阻塞
+                    # 没有任何任务还在推进时才判终态：剩余任务要么 FAILED，
+                    # 要么因上游失败被 BLOCKED，运行判失败。只要还有任务在
+                    # 执行（含其他执行者持有的 RUNNING），就继续等它们跑完，
+                    # 避免无关分支被提前取消、永远卡在执行中。
                     self.store.set_run_status(run_id, RunStatus.FAILED)
                     break
                 # 被其他执行者持有的任务（RUNNING）不属于本实例的 executing，
