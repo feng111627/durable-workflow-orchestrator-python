@@ -54,6 +54,145 @@ class TestFailureBlastRadius:
         # 无关分支不受影响，正常跑完
         assert by_name["e"].status == TaskStatus.SUCCEEDED
 
+    def test_independent_long_running_branch_not_aborted_when_sibling_fails(self, store):
+        """真实并发复现：失败分支落定失败时，无关的长任务仍在执行中。
+
+        期望：失败只级联到自己的下游；无关分支不被取消、不被回收，
+        一直跑到 SUCCEEDED；运行在无关分支跑完后才整体判 FAILED。
+        """
+        slow_running = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow(params):
+            slow_running.set()
+            # 跑得久：在整个失败判定窗口期间都处于执行中
+            await release.wait()
+            return "slow-done"
+
+        async def fail_after_slow_started(params):
+            # 保证失败发生时，无关任务确实已经真正在执行（真实并发）
+            await slow_running.wait()
+            raise FatalTaskError("branch failure")
+
+        handlers.register("slow", slow)
+        handlers.register("fail", fail_after_slow_started)
+        spec = WorkflowSpec(
+            name="w",
+            tasks=[
+                TaskSpec(name="bad", action="fail"),   # 会彻底失败的分支
+                TaskSpec(name="slow", action="slow"),  # 与失败分支互不相干
+            ],
+        )
+        store.save_workflow(spec)
+
+        async def go():
+            orch = Orchestrator(store, lease_seconds=30, heartbeat_interval=0.1)
+            run_id, _ = store.create_run_idempotent(spec.name, "k")
+            await orch.start_run(run_id)
+            # 等到“失败已落定、无关任务仍在执行”这个关键窗口
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 5
+            while True:
+                snap = {t.task_name: t for t in store.get_run(run_id).tasks}
+                if (snap["bad"].status == TaskStatus.FAILED
+                        and snap["slow"].status == TaskStatus.RUNNING):
+                    break
+                assert loop.time() < deadline
+                await asyncio.sleep(0.01)
+            mid = {t.task_name: t for t in store.get_run(run_id).tasks}
+            assert mid["slow"].status == TaskStatus.RUNNING
+            assert mid["slow"].owner is not None  # 租约仍被存活执行者持有
+            # 放行无关的长任务：它必须能正常跑完，而不是已被取消而永久挂起
+            release.set()
+            deadline = loop.time() + 5
+            while True:
+                info = store.get_run(run_id)
+                snap = {t.task_name: t for t in info.tasks}
+                if snap["slow"].status == TaskStatus.SUCCEEDED:
+                    break
+                assert loop.time() < deadline, "independent task stuck, never finished"
+                await asyncio.sleep(0.01)
+            info = store.get_run(run_id)
+            await orch.shutdown()
+            return info
+
+        info = asyncio.run(go())
+        # 运行整体仍然失败（失败分支 + 其下游语义不变）……
+        assert info.status == RunStatus.FAILED
+        by_name = {t.task_name: t for t in info.tasks}
+        assert by_name["bad"].status == TaskStatus.FAILED
+        # ……但无关分支正常跑完，没有被牵连、没有卡在 RUNNING
+        assert by_name["slow"].status == TaskStatus.SUCCEEDED
+        assert by_name["slow"].result == "slow-done"
+        assert by_name["slow"].owner is None
+
+    def test_poisoned_failed_run_self_heals_after_restart(self, store):
+        """旧版本中毒状态恢复：运行已判 FAILED，无关分支任务却还挂着。
+
+        直接构造两种卡住的形态：无关任务停在 RUNNING（执行者失联留下的
+        孤儿）、另一条无关分支停在 PENDING（没人再推进）。重启服务后
+        它们必须被识别出来重新推进到 SUCCEEDED，而失败分支及其下游
+        维持 FAILED / BLOCKED，运行最终仍是 FAILED。
+        """
+        calls = {"slow": 0, "ind": 0}
+
+        def slow(params):
+            calls["slow"] += 1
+            return "slow-done"
+
+        def ind(params):
+            calls["ind"] += 1
+            return "ind-done"
+
+        handlers.register("slow", slow)
+        handlers.register("ind", ind)
+        spec = WorkflowSpec(
+            name="w",
+            tasks=[
+                TaskSpec(name="bad", action="ind"),
+                TaskSpec(name="down", action="ind", depends_on=["bad"]),
+                TaskSpec(name="slow", action="slow"),   # 无关分支：卡在 RUNNING
+                TaskSpec(name="ind", action="ind"),  # 无关分支：卡在 PENDING
+            ],
+        )
+        store.save_workflow(spec)
+        run_id, _ = store.create_run_idempotent(spec.name, "k")
+
+        # 构造旧版本留下的中毒状态：bad 失败、down 级联阻塞；
+        # slow 被一个已经失联的执行者“执行中”，ind 还在 PENDING；
+        # 运行整体却已经被判 FAILED（旧行为），无人再推进。
+        token = store.claim_task(run_id, "bad", "lost-executor", lease_seconds=30.0)
+        assert store.fail_task_and_block_downstream(
+            run_id, "bad", "lost-executor", token, "fatal: boom"
+        ) is True
+        token_slow = store.claim_task(
+            run_id, "slow", "lost-executor", lease_seconds=0.0
+        )  # 租约立即过期，模拟执行者已失联
+        assert token_slow > 0
+        store.set_run_status(run_id, RunStatus.FAILED)
+        poisoned = {t.task_name: t for t in store.get_run(run_id).tasks}
+        assert poisoned["slow"].status == TaskStatus.RUNNING
+        assert poisoned["ind"].status == TaskStatus.PENDING
+
+        async def reboot():
+            orch = Orchestrator(store, lease_seconds=0.3, heartbeat_interval=0.1)
+            recovered = await orch.recover_unfinished()
+            assert run_id in recovered  # 带非终态任务的失败运行也会被识别
+            info = await orch.wait_run(run_id, timeout=5)
+            await orch.shutdown()
+            return info
+
+        info = asyncio.run(reboot())
+        assert info.status == RunStatus.FAILED
+        by_name = {t.task_name: t for t in info.tasks}
+        assert by_name["bad"].status == TaskStatus.FAILED
+        assert by_name["down"].status == TaskStatus.BLOCKED
+        assert by_name["slow"].status == TaskStatus.SUCCEEDED
+        assert by_name["slow"].result == "slow-done"
+        assert by_name["ind"].status == TaskStatus.SUCCEEDED
+        assert by_name["ind"].result == "ind-done"
+        assert calls == {"slow": 1, "ind": 1}
+
     def test_blocked_downstream_resumes_after_upstream_recovery(self, store):
         calls = {"a": 0, "b": 0, "c": 0}
 

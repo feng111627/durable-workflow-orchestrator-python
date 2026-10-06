@@ -75,7 +75,7 @@ class Orchestrator:
         if reclaimed:
             logger.info("reclaimed %d task(s) from lost executors", reclaimed)
         recovered: list[str] = []
-        for run in self.store.list_unfinished_runs():
+        for run in self.store.list_runs_needing_reconciliation():
             await self.start_run(run.run_id)
             recovered.append(run.run_id)
         return recovered
@@ -133,7 +133,7 @@ class Orchestrator:
                     "executor %s reclaimed %d task(s) from lost executors",
                     self.executor_id, reclaimed,
                 )
-            for run in self.store.list_unfinished_runs():
+            for run in self.store.list_runs_needing_reconciliation():
                 await self.start_run(run.run_id)
 
     # ---- 内部实现 ----
@@ -162,25 +162,31 @@ class Orchestrator:
             while True:
                 info = self.store.get_run(run_id)
                 by_name = {t.task_name: t for t in info.tasks}
-                if any(t.status == TaskStatus.FAILED for t in info.tasks):
-                    self.store.set_run_status(run_id, RunStatus.FAILED)
-                    break
                 if all(t.status == TaskStatus.SUCCEEDED for t in info.tasks):
                     self.store.set_run_status(run_id, RunStatus.SUCCEEDED)
                     break
-                # 找出可以开始的任务：PENDING 且所有依赖都已 SUCCEEDED
+                # 找出可以开始的任务：PENDING 且所有依赖都已 SUCCEEDED。
+                # 失败只会把自己的下游级联成 BLOCKED；与失败任务没有依赖
+                # 关系的 PENDING 任务（包括其它并行分支）依旧会在这里被正常
+                # 拉起，不会因为别的分支失败而被牵连停掉。
+                any_ready = False
                 for t in info.tasks:
                     if t.status != TaskStatus.PENDING:
                         continue
                     if all(by_name[d].status == TaskStatus.SUCCEEDED for d in deps[t.task_name]):
+                        any_ready = True
                         executing.add(
                             asyncio.create_task(
                                 self._execute_task(run_id, task_specs[t.task_name])
                             )
                         )
                 any_running = any(t.status == TaskStatus.RUNNING for t in info.tasks)
-                if not executing and not any_running:
-                    # 没有可推进的任务也未达终态：剩余任务因依赖失败被阻塞
+                if not executing and not any_running and not any_ready:
+                    # 没有本实例在跑、没有任何执行者在跑、也没有可拉起的任务：
+                    # 剩余任务只可能是 FAILED / BLOCKED（其失败祖先未恢复），
+                    # 这时才把运行判为失败。注意：其它分支上仍在执行的任务
+                    # （any_running）必须等它跑完，不能在这里提前判失败并
+                    # 在 finally 里把它们取消掉，否则会永久卡在 RUNNING。
                     self.store.set_run_status(run_id, RunStatus.FAILED)
                     break
                 # 被其他执行者持有的任务（RUNNING）不属于本实例的 executing，

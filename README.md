@@ -61,7 +61,9 @@ curl localhost:8000/executors
 
 ## 失败影响面与恢复续跑
 
-- 某个任务彻底失败（FAILED）后，它的**直接和间接下游**中尚未开始的任务会被级联标记为 `BLOCKED`（`error` 字段注明被哪个上游阻塞），不会混在普通的 PENDING 等待里；整个运行标记 FAILED。与失败任务无关的分支不受影响，照常执行。
+- 某个任务彻底失败（FAILED）后，它的**直接和间接下游**中尚未开始的任务会被级联标记为 `BLOCKED`（`error` 字段注明被哪个上游阻塞），不会混在普通的 PENDING 等待里。
+- **失败影响面有明确边界：只影响失败任务自己的下游。** 与失败任务没有依赖关系的其它分支完全不受牵连：即使某个分支已经彻底失败，无关分支上已经在执行（RUNNING）的任务也不会被取消、不会被回收，会一直正常跑到 SUCCEEDED；尚未开始的无关任务也会照常被拉起调度。只有当所有任务都到达终态（成功，或失败/被失败祖先阻塞）后，整个运行才会被标记为 FAILED——不会再出现“运行已经判失败，却还有任务永远卡在执行中、没人推进”的不一致状态。
+- **历史脏状态自愈**：旧版本可能在数据库里留下“运行已是 FAILED、无关分支任务却停在 RUNNING/PENDING”的状态。服务重启（以及每个实例后台接管循环的周期扫描）除了扫描未完成运行外，还会识别这种带非终态任务的失败运行：失联执行者留下的 RUNNING 任务租约过期后被接管重跑，PENDING 的无关任务被继续推进，失败分支及其 BLOCKED 下游维持原样，运行在无关节点收尾后仍是 FAILED；任务全部终态的失败运行不会被重新拉起。
 - 通过 rerun 接口把 FAILED 任务重新排队（`FAILED -> PENDING`）后，所有不再有失败祖先的 `BLOCKED` 任务会**自动解除阻塞**回到 PENDING，顺着依赖继续跑完，不需要重新提交整个工作流；菱形依赖下，只有当全部失败的上游都恢复后下游才解除阻塞。
 - 对任务的非法操作返回 409 及**可区分**的 `reason`，便于调用方分别处理：
   - `task_already_succeeded`：任务已成功，任何情况下都不会再跑；
@@ -109,7 +111,32 @@ uv run pytest tests/ -v
 - **服务重启后的续跑恢复**（2 例）：中断运行续跑且已成功任务不重跑、已完成运行不被恢复。
 - **并发控制与幂等**（5 例）：并发上限遵守且排队任务不丢弃、重复调度不重复执行、并发认领 CAS 拒绝、非法状态迁移拒绝、并发下幂等创建唯一。
 - **多执行者安全与失联接管**（6 例）：存活执行者的任务不可被抢、租约过期接管且 attempts 连续计数、**8 线程真实并发认领恰有一个成功**、失联执行者迟到写回被忽略（双执行者引擎级场景）、存储层栅栏拒绝、心跳阻止存活同伴被接管。
-- **失败影响面标记与恢复续跑**（5 例）：直接+间接下游级联 BLOCKED 且无关分支不受影响、上游恢复后下游自动续跑（不重提交流程）、菱形依赖全部上游恢复才解除阻塞、对 BLOCKED/RUNNING 任务的非法操作返回可区分 reason。
+- **失败影响面标记与恢复续跑**（7 例）：直接+间接下游级联 BLOCKED 且无关分支不受影响、**真实并发下一个分支彻底失败时无关的长任务不被取消并正常跑完（运行最终仍 FAILED）**、**历史脏状态（FAILED 运行里挂着 RUNNING/PENDING 的无关任务）重启后自愈**、上游恢复后下游自动续跑（不重提交流程）、菱形依赖全部上游恢复才解除阻塞、对 BLOCKED/RUNNING 任务的非法操作返回可区分 reason。
+
+### 本地手动验证失败影响面边界
+
+```bash
+# 起一个单实例服务
+ORCH_DB_PATH=/tmp/orch-blast.db PORT=8000 uv run python main.py
+
+# 两个互不相干的并行分支：bad 立即失败，slow 要跑 20 秒
+curl -X POST localhost:8000/workflows -H 'content-type: application/json' -d \
+'{"name":"blast","tasks":[
+  {"name":"bad","action":"fail","params":{"kind":"fatal"}},
+  {"name":"slow","action":"sleep","params":{"seconds":20}}
+]}'
+RID=$(curl -s -X POST localhost:8000/workflows/blast/runs -H 'content-type: application/json' \
+  -d '{"idempotency_key":"r1"}' | sed 's/.*"run_id":"\([^"]*\)".*/\1/')
+
+# 失败落定后立即查询：bad=FAILED，slow 仍然是 RUNNING（owner 为本实例），
+# 运行可能暂时还是 RUNNING，slow 不会被取消
+curl -s localhost:8000/runs/$RID
+# 约 20 秒后再查：slow=SUCCEEDED、owner 清空，运行整体 status=FAILED
+sleep 20
+curl -s localhost:8000/runs/$RID
+```
+
+要点：失败只级联到自己的下游；无关的 `slow` 全程不被打断、不被回收，正常跑完后运行才整体判失败；不会出现 slow 永远卡在 RUNNING 的情况。
 
 ### 本地手动验证多实例行为
 

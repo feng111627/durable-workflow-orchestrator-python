@@ -173,6 +173,33 @@ class Store:
             ).fetchall()
         return [self.get_run(r["run_id"]) for r in rows]
 
+    def list_runs_needing_reconciliation(self) -> list[RunInfo]:
+        """列出仍需要调度推进的运行。
+
+        包含两类：
+        1. 状态为 PENDING/RUNNING 的正常未完成运行；
+        2. 运行已被标记 FAILED，但其中仍存在非终态任务
+           （RUNNING/PENDING）的运行——这是旧版本“一个任务失败就整体
+           停止调度”留下的不一致状态：运行判了失败，无关分支上的任务
+           却还卡在执行中、没人推进。这些任务与失败任务没有依赖关系，
+           应当继续跑完；SUCCEEDED 运行的任务全部终态，不会被列出。
+        """
+        nonterminal = (TaskStatus.PENDING.value, TaskStatus.RUNNING.value)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT run_id FROM runs WHERE status IN (?, ?) "
+                "OR (status = ? AND EXISTS ("
+                "  SELECT 1 FROM task_runs WHERE task_runs.run_id = runs.run_id "
+                "  AND status IN (?, ?)))",
+                (
+                    RunStatus.PENDING.value,
+                    RunStatus.RUNNING.value,
+                    RunStatus.FAILED.value,
+                    *nonterminal,
+                ),
+            ).fetchall()
+        return [self.get_run(r["run_id"]) for r in rows]
+
     def set_run_status(self, run_id: str, status: RunStatus) -> None:
         with self._lock, self._conn:
             self._conn.execute(
